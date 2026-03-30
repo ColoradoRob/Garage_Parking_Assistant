@@ -1,135 +1,82 @@
-/* Garage Parking Sensor
- *
- * Original code by Bob Torrence -- https://create.arduino.cc/projecthub/Bcjams/garage-parking-assistant-11446b
- * Major revision by galmiklos (added eeprom storage for stop distance set by button, added sleep feature, optimized code for any # LEDs)
- * Additional optimizations/features by jeboo
- * 
- * Version history:
- * 0.5 -- Switched timer library to MillisTimer (galmiklos code appeared to use customized/unavailable library)
- *        Fixed push-button setting for stopdistance: can still specify static value; setting via button no longer requires a reboot
- *        Added option (SLEEP_POLLDELAY) to poll less often once in sleep mode
- *        Added option for independent left and right LED strip control; allows differing colors, animations, etc.
- *
- * 0.6 -- Added EEPROM dependency and switched to QuickMedianLib for compatibility with megaAVR boards (tested on Nano Every).
- * 
- * 0.7 -- Cosmetic bugfix: Changed amber LED behavior to only show when car is close to stop.
- * 
- * 0.8 -- Changed polling code to NewPing library. This library fixes blocking that may occur on some HC-SR04s when the distance
- *        is beyond 400cm. NewPing also has built-in iterative polling and median calculation, simplifying the code greatly.
- *
- * 0.9 -- Fixed amber-to-green transition bug.
-  *
- * 0.10 - Fixed lights not showing in mirrored mode; added version code upon power cycle. LEDs will show White = major, Red = minor version for 3s.
- */
- 
-#include <FastLED.h>
+#include <Adafruit_NeoPixel.h> // Lights
+#include <NewPing.h> // Ultrasound distance sensor
 #include <MillisTimer.h>
-#include <EEPROM.h>
-#include <NewPing.h>
+#include <Preferences.h> // persistent storage for the StopDistance
 
-// defining the parameters/layout
-#define NUM_LEDS                30      // # LEDs on each side
-#define AMBER_LEDS              5       // number of amber LEDs when car is close to stop
-#define DISTANCE_TOLERANCE      5       // tolerance to determine if the car is stopped (CENTIMETERS)
-#define LED_TIMEOUT             60000   // in milliseconds, time before lights go out (sleep) once car stopped
-#define SLEEP_POLLDELAY         1000    // in milliseconds, delay for each main loop iteration while in sleep mode
-
-// defining the hardware
-#define BUTTON_PIN              6       // push-button for setting stopdistance (optional)
-#define LED_PIN_L               7       // left-sided LEDs (or both sides if mirror_LEDs set to true)
-#define LED_PIN_R               8       // right-sided LEDs (optional), implemented by setting mirror_LEDs below to false
-#define TRIG_PIN                9
-#define ECHO_PIN                10
+// NeoPixel bars
+#define LED_PIN        D7
+#define LED_COUNT      34
+// Ultrasound Sensor
+#define TRIG_PIN                D9
+#define ECHO_PIN                D10
 #define MAX_DISTANCE            400     // HC-SR04 max distance is 400CM
+#define DISTANCE_TOLERANCE      5       // tolerance to determine if the car is stopped (CENTIMETERS)
 
-// version
-#define MAJOR_VER               1
-#define MINOR_VER               10
+#define LED_TIMEOUT             10000   // in milliseconds, time before lights go out (sleep) once car stopped
+#define BUTTON_PIN              D6       // push-button for setting stopdistance
 
-// defined variables
 const int startdistance =       400;    // distance from sensor to begin scan as car pulls in (CENTIMETERS)
-int stopdistance =              10;      // parking position from sensor (CENTIMETERS); either specify here, or leave as zero and set dynamically with push-button
+int stopdistance =              0;      // parking position from sensor (CENTIMETERS); either specify here, or leave as zero and set dynamically with push-button
 const int durationarraysz =     20;     // number of measurements to take per cycle
-const bool mirror_LEDs =        true;   // true = L + R LEDs controlled by LED_PIN_L (mirrored, as in stock project)
 
-// variables
-CRGB leds_L[NUM_LEDS], leds_R[NUM_LEDS];
-int distance, previous_distance, increment, i;
-unsigned int uS;
-uint16_t stopdistance_ee EEMEM;
+int distance, previous_distance, i;
+unsigned int uS; // raw ultrasound sensor output
+
+Preferences prefs;
+uint16_t stopdistance_prefs = 10;
 MillisTimer timer = MillisTimer(LED_TIMEOUT);
 bool LED_sleep;
 
-NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
+int delayval = 500;
+int currentColor = 0;
+int bars_to_light = LED_COUNT;
+int relative_distance = 0;
+int range = startdistance - stopdistance;
+int warn = (float)LED_COUNT * 0.3;
+
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE); 
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+uint32_t green = strip.Color(0, 255, 0);
+uint32_t yellow = strip.Color(255, 255, 0);
+uint32_t red = strip.Color(255, 0, 0);
+uint32_t color = green;
 
 void sleepmode_start(MillisTimer &mt)
 {
-  for (i = 0; i < NUM_LEDS; i++)
-  {
-      leds_L[i] = leds_R[i] = CRGB::Black;
-  }
-  FastLED.show();
-
+  strip.clear();
+  strip.show();
   timer.reset();
   LED_sleep = true;
 }
 
-void setup()
-{
-  CRGB temp_color;
+void setup() {
+  strip.begin(); 
+  strip.setBrightness(100); 
+  strip.clear();
+  strip.show();  
   LED_sleep = false;
-
+  Serial.begin(9600);
+  // NVRam storage for the preferred stopdistance
+  prefs.begin("settings", false);
   if (!stopdistance)
   {
-    stopdistance = eeprom_read_word(&stopdistance_ee);
+    stopdistance = prefs.getUInt("stopDist", 10);
   }
-  increment = (startdistance - stopdistance)/NUM_LEDS;
-  
+
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  FastLED.addLeds<WS2812, LED_PIN_L, GRB>(leds_L, NUM_LEDS);
-  FastLED.addLeds<WS2812, mirror_LEDs ? LED_PIN_L : LED_PIN_R, GRB>(leds_R, NUM_LEDS);
-  
- // flash major/minor version for 3s
-  for(i = 0; i < NUM_LEDS; i++)
-  {
-      temp_color = CRGB::Black;
-
-      if (i < (MAJOR_VER)) { temp_color = CRGB::White; }
-      else if ((i > (MAJOR_VER) && (i < (MAJOR_VER + 1 + MINOR_VER)))) { temp_color = CRGB::Red; }
-
-      leds_L[i] = leds_R[i] = temp_color;
-  }
-
-  FastLED.show();
-
-  delay(3000);
-
-  // clear LEDs  
-  for(i = 0; i < NUM_LEDS; i++)
-        leds_L[i] = leds_R[i] = CRGB::Black;
-  
-  FastLED.show();
-
   timer.setInterval(LED_TIMEOUT);
   timer.expiredHandler(sleepmode_start);
   timer.setRepeats(0);
-
-  Serial.begin(9600);
 }
 
-void loop()
-{
+void loop() {
   timer.run();
 
   uS = sonar.ping_median(durationarraysz, MAX_DISTANCE);
   distance = sonar.convert_cm(uS);
-  
-  //Serial.print("stopdistance: "); Serial.println(stopdistance);
-  //Serial.print("distance: "); Serial.println(distance);
-  //Serial.print("previous_distance: "); Serial.println(previous_distance);
 
-  // check if distance changed is within tolerance
+  // Check if we've stopped moving
   if (abs(distance - previous_distance) < DISTANCE_TOLERANCE)
   {      
     if (!timer.isRunning() && !LED_sleep)
@@ -143,52 +90,48 @@ void loop()
     timer.reset();
     LED_sleep = false;
   }
-
-  // check button state
+  // If buttonpress, save the current distance as our preferred stopdistance
   if (digitalRead(BUTTON_PIN) == LOW)
   {
     stopdistance = distance;
-    eeprom_write_word(&stopdistance_ee, stopdistance);
-    increment = (startdistance - stopdistance)/NUM_LEDS;
+    range = startdistance - stopdistance;
+    // Replacement for: eeprom_write_word(&stopdistance_ee, stopdistance);
+    prefs.putUInt("stopDist", stopdistance);
   }
 
-  if (!LED_sleep)
+  relative_distance = distance - stopdistance;
+  bars_to_light = (int)(((float)relative_distance / range) * LED_COUNT);
+  if (LED_sleep)
   {
-    // turn off lights when beyond startdistance
-    if (distance > startdistance)
-    {
-      for (i = 0; i < NUM_LEDS; i++)
-      {
-        leds_L[i] = leds_R[i] = CRGB::Black;
-      }    
-    }
-    else if (distance <= stopdistance) // either past stopdistance or limit of sensor (reported as distance=0)
-    {
-      for (i = 0; i < NUM_LEDS; i++)
-      {
-        leds_L[i] = leds_R[i] = distance ? CRGB::Red : CRGB::Black;
-      }
-    }
-    else
-    {
-      for (i = 0; i < NUM_LEDS; i++) // fill entire LED array with orange/green/black
-      {
-        if (distance > (stopdistance+increment*i))
-        {
-          leds_L[i] = leds_R[i] = (distance <= (stopdistance+(AMBER_LEDS)*increment)) ? CRGB::Orange : CRGB::Green;
-        }
-        else
-        {
-          leds_L[i] = leds_R[i] = CRGB::Black;
-        }
-      }
-    }    
-    FastLED.show();
-    delay(50);
-  }  
-  else
-  {
-    delay(SLEEP_POLLDELAY);
-    //Serial.println("Sleep");
+    strip.clear();
+    strip.show();
   }
+  else
+  { 
+    color = green;
+    if(bars_to_light < 4){ // TODO - make this %age of total lights
+      color = red;
+    } else if(bars_to_light <= warn){
+      color = yellow;
+    }
+
+    if(bars_to_light > 0){
+      strip.clear();
+      for(i=0; i < bars_to_light; i++){
+        strip.setPixelColor(i, color);
+      }
+      strip.show();
+    } else {
+      if(distance == 0){ // no signal
+        strip.fill(green);
+        strip.show();
+      } 
+      else 
+      {
+        strip.fill(red);
+        strip.show();
+      }
+    }
+  }
+  delay(delayval);
 }
